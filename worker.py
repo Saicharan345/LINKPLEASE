@@ -19,10 +19,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-API_BASE = os.getenv(
-    "PSEUDOGRAM_API_BASE", "https://pseudogram-api.onrender.com"
-)
-API_KEY = os.getenv("PSEUDOGRAM_API_KEY", "")
+def get_api_base() -> str:
+    return os.getenv(
+        "PSEUDOGRAM_API_BASE", "https://pseudogram-api.onrender.com"
+    )
+
+
+def get_api_key() -> str:
+    return os.getenv("PSEUDOGRAM_API_KEY", "")
+
 
 
 # ──────────────────────────────────────────────────────────
@@ -119,14 +124,14 @@ class DMSenderWorker:
 
         try:
             resp = await client.post(
-                f"{API_BASE}/v1/dm/send",
+                f"{get_api_base()}/v1/dm/send",
                 json={
                     "recipient_user_id": dm["user_id"],
                     "message": dm["dm_message"],
                     "comment_id": dm["comment_id"],
                 },
                 headers={
-                    "X-API-Key": API_KEY,
+                    "X-API-Key": get_api_key(),
                     "Idempotency-Key": dm["idempotency_key"],
                 },
             )
@@ -143,13 +148,26 @@ class DMSenderWorker:
     async def _handle_response(self, resp: httpx.Response, dm: dict):
         task_id = dm["id"]
 
-        if resp.status_code == 202:
+        if resp.status_code in (200, 202):
             data = resp.json()
             api_dm_id = data.get("dm_id", "")
-            await self.db.mark_dm_accepted(task_id, api_dm_id)
-            logger.info(
-                f"DM accepted: dm_id={api_dm_id}  comment={dm['comment_id']}"
-            )
+            api_status = data.get("status", "")
+            
+            if api_status == "delivered":
+                await self.db.mark_dm_delivered(task_id)
+                logger.info(
+                    f"DM delivered directly: dm_id={api_dm_id} comment={dm['comment_id']}"
+                )
+            elif api_status == "failed":
+                logger.warning(
+                    f"DM failed directly: dm_id={api_dm_id} comment={dm['comment_id']}, scheduling retry"
+                )
+                await self._schedule_retry(dm)
+            else:
+                await self.db.mark_dm_accepted(task_id, api_dm_id)
+                logger.info(
+                    f"DM accepted: dm_id={api_dm_id} comment={dm['comment_id']}"
+                )
 
         elif resp.status_code == 429:
             retry_after = int(resp.headers.get("Retry-After", 60))
@@ -254,8 +272,8 @@ class ReconciliationWorker:
     async def _check_one(self, client: httpx.AsyncClient, dm: dict):
         try:
             resp = await client.get(
-                f"{API_BASE}/v1/dm/{dm['dm_id']}",
-                headers={"X-API-Key": API_KEY},
+                f"{get_api_base()}/v1/dm/{dm['dm_id']}",
+                headers={"X-API-Key": get_api_key()},
             )
             if resp.status_code != 200:
                 return

@@ -108,16 +108,30 @@ def _verify_signature(body: bytes, signature_header: str) -> bool:
     """
     Part B — verify HMAC-SHA256 webhook signature.
     The API signs the raw body with our API key as the HMAC secret.
+    Handles both `sha256=<hex>` and raw `<hex>` signature formats.
     """
     if not API_KEY:
         return True  # no key configured — can't verify
     if not signature_header:
         return False
 
-    expected = "sha256=" + hmac.new(
+    computed_hex = hmac.new(
         API_KEY.encode(), body, hashlib.sha256
     ).hexdigest()
-    return hmac.compare_digest(signature_header, expected)
+
+    # Try both formats: `sha256=<hex>` and raw `<hex>`
+    expected_prefixed = "sha256=" + computed_hex
+    if hmac.compare_digest(signature_header, expected_prefixed):
+        return True
+    if hmac.compare_digest(signature_header, computed_hex):
+        return True
+
+    logger.warning(
+        f"Signature mismatch: received={signature_header[:20]}... "
+        f"expected_prefixed={expected_prefixed[:20]}... "
+        f"expected_raw={computed_hex[:20]}..."
+    )
+    return False
 
 
 # ════════════════════════════════════════════════════════
@@ -289,3 +303,27 @@ async def get_stats():
       duplicates_blocked — DMs correctly not sent
     """
     return await db.get_stats()
+
+
+# ════════════════════════════════════════════════════════
+#  GET /health
+# ════════════════════════════════════════════════════════
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "ok", "service": "linkplease"}
+
+
+# ════════════════════════════════════════════════════════
+#  GET /rules
+# ════════════════════════════════════════════════════════
+
+
+@app.get("/rules")
+async def list_rules():
+    """List all active keyword rules."""
+    rules = await db.get_all_rules()
+    return {"rules": rules, "count": len(rules)}
+
