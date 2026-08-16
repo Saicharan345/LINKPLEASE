@@ -108,7 +108,7 @@ def _verify_signature(body: bytes, signature_header: str) -> bool:
     """
     Part B — verify HMAC-SHA256 webhook signature.
     The API signs the raw body with our API key as the HMAC secret.
-    Handles both `sha256=<hex>` and raw `<hex>` signature formats.
+    Handles both `sha256=<hex>` and raw `<hex>` signature formats (case-insensitive).
     """
     if not API_KEY:
         return True  # no key configured — can't verify
@@ -119,19 +119,42 @@ def _verify_signature(body: bytes, signature_header: str) -> bool:
         API_KEY.encode(), body, hashlib.sha256
     ).hexdigest()
 
-    # Try both formats: `sha256=<hex>` and raw `<hex>`
-    expected_prefixed = "sha256=" + computed_hex
-    if hmac.compare_digest(signature_header, expected_prefixed):
+    # Try both formats: `sha256=<hex>` and raw `<hex>` (case-insensitive)
+    sig_lower = signature_header.lower()
+    expected_prefixed = ("sha256=" + computed_hex).lower()
+    expected_raw = computed_hex.lower()
+
+    if hmac.compare_digest(sig_lower, expected_prefixed):
         return True
-    if hmac.compare_digest(signature_header, computed_hex):
+    if hmac.compare_digest(sig_lower, expected_raw):
         return True
 
     logger.warning(
         f"Signature mismatch: received={signature_header[:20]}... "
         f"expected_prefixed={expected_prefixed[:20]}... "
-        f"expected_raw={computed_hex[:20]}..."
+        f"expected_raw={expected_raw[:20]}..."
     )
     return False
+
+
+# In-memory webhook log buffer for remote debugging
+_webhook_logs: list[dict] = []
+
+
+def _log_debug_webhook(headers: dict, body: str, sig: str, verified: bool, status: int, error: str = None):
+    global _webhook_logs
+    _webhook_logs.append({
+        "time": time.time(),
+        "headers": headers,
+        "body": body,
+        "sig": sig,
+        "verified": verified,
+        "status": status,
+        "error": error
+    })
+    # Keep last 100 entries
+    if len(_webhook_logs) > 100:
+        _webhook_logs.pop(0)
 
 
 # ════════════════════════════════════════════════════════
@@ -148,11 +171,24 @@ async def webhook(request: Request):
     does fast, synchronous DB writes (< 5 ms per event).
     """
     body = await request.body()
+    headers_dict = dict(request.headers)
+    body_str = ""
+    try:
+        body_str = body.decode("utf-8", errors="replace")
+    except Exception:
+        pass
 
     # ── Part B: signature verification ──
     sig = request.headers.get("X-PseudoGram-Signature", "")
-    if sig and not _verify_signature(body, sig):
+    
+    # If a signature is provided, verify it.
+    verified = True
+    if sig:
+        verified = _verify_signature(body, sig)
+
+    if sig and not verified:
         logger.warning("Webhook rejected — invalid signature")
+        _log_debug_webhook(headers_dict, body_str, sig, False, 401, "invalid_signature")
         return JSONResponse(
             status_code=401, content={"error": "invalid_signature"}
         )
@@ -161,6 +197,7 @@ async def webhook(request: Request):
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
+        _log_debug_webhook(headers_dict, body_str, sig, verified, 400, "invalid_json")
         return JSONResponse(
             status_code=400, content={"error": "invalid_json"}
         )
@@ -168,6 +205,7 @@ async def webhook(request: Request):
     event_id = payload.get("event_id")
     event_type = payload.get("event_type")
     if not event_id or not event_type:
+        _log_debug_webhook(headers_dict, body_str, sig, verified, 400, "missing_fields")
         return JSONResponse(
             status_code=400, content={"error": "missing_fields"}
         )
@@ -176,6 +214,7 @@ async def webhook(request: Request):
     is_new = await db.mark_event_processed(event_id, event_type)
     if not is_new:
         logger.debug(f"Duplicate event skipped: {event_id}")
+        _log_debug_webhook(headers_dict, body_str, sig, verified, 200, "duplicate_event_skipped")
         return {"status": "ok", "detail": "duplicate_event"}
 
     # ── Route by event type ──
@@ -188,6 +227,7 @@ async def webhook(request: Request):
     else:
         logger.debug(f"Ignored event type: {event_type}")
 
+    _log_debug_webhook(headers_dict, body_str, sig, verified, 200)
     return {"status": "ok"}
 
 
@@ -326,4 +366,16 @@ async def list_rules():
     """List all active keyword rules."""
     rules = await db.get_all_rules()
     return {"rules": rules, "count": len(rules)}
+
+
+# ════════════════════════════════════════════════════════
+#  GET /debug-webhooks
+# ════════════════════════════════════════════════════════
+
+
+@app.get("/debug-webhooks")
+async def get_debug_webhooks():
+    """Expose the last 100 webhook requests for remote debugging."""
+    return {"logs": _webhook_logs, "count": len(_webhook_logs)}
+
 
