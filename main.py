@@ -12,7 +12,6 @@ POST /rules     — create keyword → DM rules
 GET  /stats     — live processing statistics
 """
 
-import base64
 import hashlib
 import hmac
 import json
@@ -107,61 +106,42 @@ app = FastAPI(
 
 def _verify_signature(body: bytes, signature_header: str) -> bool:
     """
-    Part B — verify HMAC-SHA256 webhook signature.
-    The API signs the raw body with our API key's email prefix as the HMAC secret.
-    Handles both `sha256=<hex>` and raw `<hex>` signature formats (case-insensitive).
+    Verify HMAC-SHA256 of the raw request body using PSEUDOGRAM_API_KEY
+    as the secret. Header format: X-PseudoGram-Signature: sha256=<hex>
     """
-    if not API_KEY:
-        return True  # no key configured — can't verify
-    if not signature_header:
+    if not API_KEY or not signature_header:
         return False
 
-    # Extract email secret from API key (the prefix before the dot is base64-encoded email)
-    secret = API_KEY
-    if "." in API_KEY:
-        try:
-            prefix = API_KEY.split(".")[0]
-            # Add padding if necessary
-            padding = len(prefix) % 4
-            if padding:
-                prefix += "=" * (4 - padding)
-            secret = base64.b64decode(prefix).decode("utf-8")
-        except Exception as e:
-            logger.error(f"Failed to decode email from API_KEY: {e}")
+    prefix = "sha256="
+    if not signature_header.lower().startswith(prefix):
+        return False
 
+    provided_hex = signature_header[len(prefix):].strip().lower()
     computed_hex = hmac.new(
-        secret.encode(), body, hashlib.sha256
+        API_KEY.encode(),
+        body,
+        hashlib.sha256,
     ).hexdigest()
 
-    # Try both formats: `sha256=<hex>` and raw `<hex>` (case-insensitive)
-    sig_lower = signature_header.lower()
-    expected_prefixed = ("sha256=" + computed_hex).lower()
-    expected_raw = computed_hex.lower()
-
-    if hmac.compare_digest(sig_lower, expected_prefixed):
-        return True
-    if hmac.compare_digest(sig_lower, expected_raw):
-        return True
-
-    logger.warning(
-        f"Signature mismatch: received={signature_header[:20]}... "
-        f"expected_prefixed={expected_prefixed[:20]}... "
-        f"expected_raw={expected_raw[:20]}..."
-    )
-    return False
+    if len(provided_hex) != len(computed_hex):
+        return False
+    return hmac.compare_digest(provided_hex, computed_hex)
 
 
 # In-memory webhook log buffer for remote debugging
 _webhook_logs: list[dict] = []
 
 
-def _log_debug_webhook(headers: dict, body: str, sig: str, verified: bool, status: int, error: str = None):
+def _log_debug_webhook(headers: dict, body: str, verified: bool, status: int, error: str = None):
     global _webhook_logs
+    safe_headers = {
+        k: ("<redacted>" if k.lower() == "x-pseudogram-signature" else v)
+        for k, v in headers.items()
+    }
     _webhook_logs.append({
         "time": time.time(),
-        "headers": headers,
+        "headers": safe_headers,
         "body": body,
-        "sig": sig,
         "verified": verified,
         "status": status,
         "error": error
@@ -184,6 +164,7 @@ async def webhook(request: Request):
     All DM sending happens in background workers — this handler only
     does fast, synchronous DB writes (< 5 ms per event).
     """
+    # Raw body must be read before JSON parsing — HMAC is over the exact bytes.
     body = await request.body()
     headers_dict = dict(request.headers)
     body_str = ""
@@ -192,17 +173,11 @@ async def webhook(request: Request):
     except Exception:
         pass
 
-    # ── Part B: signature verification ──
-    sig = request.headers.get("X-PseudoGram-Signature", "")
-    
-    # If a signature is provided, verify it.
-    verified = True
-    if sig:
-        verified = _verify_signature(body, sig)
-
-    if sig and not verified:
-        logger.warning("Webhook rejected — invalid signature")
-        _log_debug_webhook(headers_dict, body_str, sig, False, 401, "invalid_signature")
+    signature_header = request.headers.get("X-PseudoGram-Signature", "")
+    verified = _verify_signature(body, signature_header)
+    if not verified:
+        logger.warning("Webhook rejected: invalid or missing signature")
+        _log_debug_webhook(headers_dict, body_str, False, 401, "invalid_signature")
         return JSONResponse(
             status_code=401, content={"error": "invalid_signature"}
         )
@@ -211,7 +186,7 @@ async def webhook(request: Request):
     try:
         payload = json.loads(body)
     except json.JSONDecodeError:
-        _log_debug_webhook(headers_dict, body_str, sig, verified, 400, "invalid_json")
+        _log_debug_webhook(headers_dict, body_str, verified, 400, "invalid_json")
         return JSONResponse(
             status_code=400, content={"error": "invalid_json"}
         )
@@ -219,7 +194,7 @@ async def webhook(request: Request):
     event_id = payload.get("event_id")
     event_type = payload.get("event_type")
     if not event_id or not event_type:
-        _log_debug_webhook(headers_dict, body_str, sig, verified, 400, "missing_fields")
+        _log_debug_webhook(headers_dict, body_str, verified, 400, "missing_fields")
         return JSONResponse(
             status_code=400, content={"error": "missing_fields"}
         )
@@ -228,7 +203,7 @@ async def webhook(request: Request):
     is_new = await db.mark_event_processed(event_id, event_type)
     if not is_new:
         logger.debug(f"Duplicate event skipped: {event_id}")
-        _log_debug_webhook(headers_dict, body_str, sig, verified, 200, "duplicate_event_skipped")
+        _log_debug_webhook(headers_dict, body_str, verified, 200, "duplicate_event_skipped")
         return {"status": "ok", "detail": "duplicate_event"}
 
     # ── Route by event type ──
@@ -241,7 +216,7 @@ async def webhook(request: Request):
     else:
         logger.debug(f"Ignored event type: {event_type}")
 
-    _log_debug_webhook(headers_dict, body_str, sig, verified, 200)
+    _log_debug_webhook(headers_dict, body_str, verified, 200)
     return {"status": "ok"}
 
 

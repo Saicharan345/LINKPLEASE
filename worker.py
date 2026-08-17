@@ -142,6 +142,14 @@ class DMSenderWorker:
                 f"Network error sending DM for comment={dm['comment_id']}: {exc}"
             )
             await self._schedule_retry(dm)
+        except Exception as exc:
+            # Keep the job retryable instead of leaving it stuck in 'sending'
+            # until process restart (e.g. malformed JSON on a 202 body).
+            logger.error(
+                f"Unexpected error sending DM for comment={dm['comment_id']}: {exc}",
+                exc_info=True,
+            )
+            await self._schedule_retry(dm)
 
     # ── response routing ──
 
@@ -149,7 +157,14 @@ class DMSenderWorker:
         task_id = dm["id"]
 
         if resp.status_code in (200, 202):
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                logger.warning(
+                    f"Unreadable API response for comment={dm['comment_id']}, scheduling retry"
+                )
+                await self._schedule_retry(dm)
+                return
             api_dm_id = data.get("dm_id", "")
             api_status = data.get("status", "")
             

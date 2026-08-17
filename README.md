@@ -94,7 +94,9 @@ curl https://pseudogram-api.onrender.com/v1/simulate/RUN_ID/truth \
 ## API Contract
 
 ### POST /webhook
-Receives comment events. Returns `200` within 5 seconds.
+Receives comment events. Returns `200` within 5 seconds after HMAC verification.
+
+Signature header: `X-PseudoGram-Signature: sha256=<hex>`, where `<hex>` is HMAC-SHA256 of the **raw request body** using `PSEUDOGRAM_API_KEY` itself as the secret. Missing or invalid signatures are rejected with `401`.
 
 ### POST /rules
 ```json
